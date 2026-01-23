@@ -13,9 +13,11 @@ template <typename TargetObj, StrategyVerifier Verifier>
 struct RandomStrategy : PickStrategy<TargetObj, Verifier> {
   explicit RandomStrategy(size_t threads_count,
                           std::vector<TaskBuilder> constructors,
-                          std::vector<int> weights)
+                          std::vector<int> weights,
+                          uint64_t seed = 0)
       : PickStrategy<TargetObj, Verifier>{threads_count,
-                                          std::move(constructors)},
+                                          std::move(constructors),
+                                          seed},
         weights{std::move(weights)} {}
 
   size_t Pick() override {

@@ -1,6 +1,7 @@
 #pragma once
 #include <gflags/gflags.h>
 
+#include <cstdint>
 #include <memory>
 
 #include "custom_round.h"
@@ -43,6 +44,7 @@ struct Opts {
   size_t tasks;
   size_t switches;
   size_t rounds;
+  uint64_t seed;
   bool minimize;
   size_t exploration_runs;
   size_t minimization_runs;
@@ -61,8 +63,8 @@ std::unique_ptr<Strategy> MakeStrategy(Opts &opts, std::vector<TaskBuilder> l) {
   switch (opts.typ) {
     case RR: {
       std::cout << "round-robin\n";
-      return std::make_unique<RoundRobinStrategy<TargetObj, Verifier>>(
-          opts.threads, std::move(l));
+        return std::make_unique<RoundRobinStrategy<TargetObj, Verifier>>(
+          opts.threads, std::move(l), opts.seed);
     }
     case RND: {
       std::cout << "random\n";
@@ -74,13 +76,13 @@ std::unique_ptr<Strategy> MakeStrategy(Opts &opts, std::vector<TaskBuilder> l) {
         throw std::invalid_argument{
             "number of threads not equal to number of weights"};
       }
-      return std::make_unique<RandomStrategy<TargetObj, Verifier>>(
-          opts.threads, std::move(l), std::move(weights));
+        return std::make_unique<RandomStrategy<TargetObj, Verifier>>(
+          opts.threads, std::move(l), std::move(weights), opts.seed);
     }
     case PCT: {
       std::cout << "pct\n";
-      return std::make_unique<PctStrategy<TargetObj, Verifier>>(
-          opts.threads, std::move(l), opts.forbid_all_same);
+        return std::make_unique<PctStrategy<TargetObj, Verifier>>(
+          opts.threads, std::move(l), opts.forbid_all_same, opts.seed);
     }
     default:
       assert(false && "unexpected type");
@@ -112,6 +114,9 @@ std::unique_ptr<Scheduler> MakeScheduler(ModelChecker &checker, Opts &opts,
                                          std::vector<TaskBuilder> l,
                                          std::vector<CustomRound> custom_rounds,
                                          PrettyPrinter &pretty_printer) {
+  if (opts.seed != 0) {
+    ExecutionGraph::getInstance().SetSeed(opts.seed);
+  }
   std::cout << "strategy = ";
   switch (opts.typ) {
     case RR:
@@ -163,6 +168,9 @@ int Run(int argc, char *argv[], std::vector<CustomRound> custom_rounds = {}) {
   std::cout << "tasks    = " << opts.tasks << "\n";
   std::cout << "switches = " << opts.switches << "\n";
   std::cout << "rounds   = " << opts.rounds << "\n";
+  if (opts.seed != 0) {
+    std::cout << "seed     = " << opts.seed << "\n";
+  }
   std::cout << "minimize = " << opts.minimize << "\n";
   if (opts.minimize) {
     std::cout << "exploration runs = " << opts.exploration_runs << "\n";

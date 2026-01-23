@@ -1,3 +1,11 @@
+#include <atomic>
+#include <set>
+#include <string>
+
+#include "llvm/IR/Constants.h"
+#include "llvm/IR/Function.h"
+#include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/Instructions.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Pass.h"
 #include "llvm/Passes/PassBuilder.h"
@@ -36,6 +44,413 @@ bool HasAttribute(const FunIndex &index, const StringRef name,
   return index.find({attr, name}) != index.end();
 }
 
+static int StdOrderFromLlvm(AtomicOrdering ordering) {
+  switch (ordering) {
+    case AtomicOrdering::Monotonic:
+      return static_cast<int>(std::memory_order_relaxed);
+    case AtomicOrdering::Acquire:
+      return static_cast<int>(std::memory_order_acquire);
+    case AtomicOrdering::Release:
+      return static_cast<int>(std::memory_order_release);
+    case AtomicOrdering::AcquireRelease:
+      return static_cast<int>(std::memory_order_acq_rel);
+    case AtomicOrdering::SequentiallyConsistent:
+      return static_cast<int>(std::memory_order_seq_cst);
+    case AtomicOrdering::NotAtomic:
+    case AtomicOrdering::Unordered:
+    default:
+      return static_cast<int>(std::memory_order_relaxed);
+  }
+}
+
+static std::string TypeSuffix(Type *ty) {
+  if (!ty->isIntegerTy()) {
+    return "";
+  }
+  unsigned bits = ty->getIntegerBitWidth();
+  switch (bits) {
+    case 1:
+      return "i1";
+    case 8:
+      return "i8";
+    case 16:
+      return "i16";
+    case 32:
+      return "i32";
+    case 64:
+      return "i64";
+    default:
+      return "";
+  }
+}
+
+static bool IsSupportedType(Type *ty) {
+  return !TypeSuffix(ty).empty();
+}
+
+static FunctionCallee GetLoadCallee(Module &M, Type *val_ty) {
+  auto &ctx = M.getContext();
+  auto suffix = TypeSuffix(val_ty);
+  std::string name = "__ltest_wmm_load_" + suffix;
+  auto void_ptr = PointerType::get(ctx, 0);
+  auto order_ty = Type::getInt32Ty(ctx);
+  std::vector<Type *> args = {void_ptr, order_ty};
+  auto fty = FunctionType::get(val_ty, args, false);
+  return M.getOrInsertFunction(name, fty);
+}
+
+static FunctionCallee GetStoreCallee(Module &M, Type *val_ty) {
+  auto &ctx = M.getContext();
+  auto suffix = TypeSuffix(val_ty);
+  std::string name = "__ltest_wmm_store_" + suffix;
+  auto void_ptr = PointerType::get(ctx, 0);
+  auto order_ty = Type::getInt32Ty(ctx);
+  std::vector<Type *> args = {void_ptr, order_ty, val_ty};
+  auto fty = FunctionType::get(Type::getVoidTy(ctx), args, false);
+  return M.getOrInsertFunction(name, fty);
+}
+
+static FunctionCallee GetCmpXchgCallee(Module &M, Type *val_ty) {
+  auto &ctx = M.getContext();
+  auto suffix = TypeSuffix(val_ty);
+  std::string name = "__ltest_wmm_cmpxchg_" + suffix;
+  auto void_ptr = PointerType::get(ctx, 0);
+  auto order_ty = Type::getInt32Ty(ctx);
+  auto i1 = Type::getInt1Ty(ctx);
+  std::vector<Type *> args = {void_ptr, val_ty, val_ty, order_ty, order_ty, i1};
+  auto ret_ty = StructType::get(ctx, {val_ty, i1});
+  auto fty = FunctionType::get(ret_ty, args, false);
+  return M.getOrInsertFunction(name, fty);
+}
+
+static FunctionCallee GetRmwCallee(Module &M, Type *val_ty) {
+  auto &ctx = M.getContext();
+  auto suffix = TypeSuffix(val_ty);
+  std::string name = "__ltest_wmm_rmw_" + suffix;
+  auto void_ptr = PointerType::get(ctx, 0);
+  auto order_ty = Type::getInt32Ty(ctx);
+  auto op_ty = Type::getInt32Ty(ctx);
+  std::vector<Type *> args = {void_ptr, order_ty, op_ty, val_ty};
+  auto fty = FunctionType::get(val_ty, args, false);
+  return M.getOrInsertFunction(name, fty);
+}
+
+static Value *ToVoidPtr(IRBuilder<> &B, Value *ptr) {
+  auto *i8ptr = PointerType::get(B.getContext(), 0);
+  if (ptr->getType() == i8ptr) {
+    return ptr;
+  }
+  return B.CreateBitCast(ptr, i8ptr);
+}
+
+static bool IsStdAtomicCall(Function *F) {
+  if (!F) {
+    return false;
+  }
+  auto name = F->getName();
+  if (name.starts_with("__ltest_wmm_")) {
+    return false;
+  }
+  return name.contains("__atomic_base") || name.contains("atomic") ||
+         name.contains("atomic_base");
+}
+
+static bool IsStdAtomicLoad(Function *F) {
+  if (!IsStdAtomicCall(F)) {
+    return false;
+  }
+  auto name = F->getName();
+  return name.contains("load") && name.contains("memory_order");
+}
+
+static bool IsStdAtomicStore(Function *F) {
+  if (!IsStdAtomicCall(F)) {
+    return false;
+  }
+  auto name = F->getName();
+  return name.contains("store") && name.contains("memory_order");
+}
+
+static bool IsStdAtomicCmpXchg(Function *F) {
+  if (!IsStdAtomicCall(F)) {
+    return false;
+  }
+  auto name = F->getName();
+  return name.contains("compare_exchange_strong") ||
+         name.contains("compare_exchange_weak");
+}
+
+static bool IsStdAtomicCmpXchgWeak(Function *F) {
+  if (!IsStdAtomicCmpXchg(F)) {
+    return false;
+  }
+  auto name = F->getName();
+  return name.contains("compare_exchange_weak");
+}
+
+struct WmmAtomicInserter {
+  explicit WmmAtomicInserter(Module &M) : M(M) {}
+
+  bool Run(const FunIndex &index) {
+    bool changed = false;
+    for (auto &F : M) {
+      if (!IsTarget(F.getName(), index)) {
+        continue;
+      }
+      changed |= InstrumentFunction(F);
+    }
+    return changed;
+  }
+
+ private:
+  bool IsTarget(const StringRef fun_name, const FunIndex &index) {
+    return HasAttribute(index, fun_name, nonatomic_attr);
+  }
+
+  bool InstrumentFunction(Function &F) {
+    SmallVector<Instruction *, 64> work;
+    for (auto &B : F) {
+      for (auto &I : B) {
+        if (auto *LI = dyn_cast<LoadInst>(&I)) {
+          if (LI->isAtomic()) {
+            work.push_back(LI);
+          }
+        } else if (auto *SI = dyn_cast<StoreInst>(&I)) {
+          if (SI->isAtomic()) {
+            work.push_back(SI);
+          }
+        } else if (auto *CX = dyn_cast<AtomicCmpXchgInst>(&I)) {
+          work.push_back(CX);
+        } else if (auto *RMW = dyn_cast<AtomicRMWInst>(&I)) {
+          work.push_back(RMW);
+        } else if (auto *CI = dyn_cast<CallInst>(&I)) {
+          if (auto *CF = CI->getCalledFunction()) {
+            if (IsStdAtomicLoad(CF) || IsStdAtomicStore(CF) ||
+                IsStdAtomicCmpXchg(CF)) {
+              work.push_back(CI);
+            }
+          }
+        }
+      }
+    }
+
+    bool changed = false;
+    for (auto *I : work) {
+      if (auto *LI = dyn_cast<LoadInst>(I)) {
+        changed |= InstrumentLoad(LI);
+      } else if (auto *SI = dyn_cast<StoreInst>(I)) {
+        changed |= InstrumentStore(SI);
+      } else if (auto *CX = dyn_cast<AtomicCmpXchgInst>(I)) {
+        changed |= InstrumentCmpXchg(CX);
+      } else if (auto *RMW = dyn_cast<AtomicRMWInst>(I)) {
+        changed |= InstrumentRmw(RMW);
+      } else if (auto *CI = dyn_cast<CallInst>(I)) {
+        changed |= InstrumentStdAtomicCall(CI);
+      }
+    }
+
+    return changed;
+  }
+
+  bool InstrumentLoad(LoadInst *LI) {
+    auto *val_ty = LI->getType();
+    if (!IsSupportedType(val_ty)) {
+      return false;
+    }
+
+    IRBuilder<> B(LI);
+    auto *order = B.getInt32(StdOrderFromLlvm(LI->getOrdering()));
+    auto *addr = ToVoidPtr(B, LI->getPointerOperand());
+    auto callee = GetLoadCallee(M, val_ty);
+    auto *call = B.CreateCall(callee, {addr, order});
+
+    LI->replaceAllUsesWith(call);
+    LI->eraseFromParent();
+    return true;
+  }
+
+  bool InstrumentStore(StoreInst *SI) {
+    auto *val_ty = SI->getValueOperand()->getType();
+    if (!IsSupportedType(val_ty)) {
+      return false;
+    }
+
+    IRBuilder<> B(SI);
+    auto *order = B.getInt32(StdOrderFromLlvm(SI->getOrdering()));
+    auto *addr = ToVoidPtr(B, SI->getPointerOperand());
+    auto *value = SI->getValueOperand();
+    auto callee = GetStoreCallee(M, val_ty);
+    B.CreateCall(callee, {addr, order, value});
+    SI->eraseFromParent();
+    return true;
+  }
+
+  bool InstrumentCmpXchg(AtomicCmpXchgInst *CX) {
+    auto *val_ty = CX->getCompareOperand()->getType();
+    if (!IsSupportedType(val_ty)) {
+      return false;
+    }
+
+    IRBuilder<> B(CX);
+    auto *order_success = B.getInt32(StdOrderFromLlvm(CX->getSuccessOrdering()));
+    auto *order_failure = B.getInt32(StdOrderFromLlvm(CX->getFailureOrdering()));
+    auto *addr = ToVoidPtr(B, CX->getPointerOperand());
+    auto *expected = CX->getCompareOperand();
+    auto *desired = CX->getNewValOperand();
+    auto *is_weak = B.getInt1(CX->isWeak());
+
+    auto callee = GetCmpXchgCallee(M, val_ty);
+    auto *call = B.CreateCall(
+        callee, {addr, expected, desired, order_success, order_failure, is_weak});
+
+    auto *new_old = ExtractValueInst::Create(call, {0}, "", CX->getNextNode());
+    auto *new_success = ExtractValueInst::Create(call, {1}, "", CX->getNextNode());
+
+    SmallVector<Instruction *, 8> to_remove;
+    for (auto *user : CX->users()) {
+      if (auto *EV = dyn_cast<ExtractValueInst>(user)) {
+        if (EV->getIndices()[0] == 0) {
+          EV->replaceAllUsesWith(new_old);
+          to_remove.push_back(EV);
+        } else if (EV->getIndices()[0] == 1) {
+          EV->replaceAllUsesWith(new_success);
+          to_remove.push_back(EV);
+        }
+      }
+    }
+
+    for (auto *I : to_remove) {
+      I->eraseFromParent();
+    }
+
+    if (CX->use_empty()) {
+      CX->eraseFromParent();
+    }
+
+    return true;
+  }
+
+  bool InstrumentRmw(AtomicRMWInst *RMW) {
+    auto *val_ty = RMW->getValOperand()->getType();
+    if (!IsSupportedType(val_ty)) {
+      return false;
+    }
+
+    IRBuilder<> B(RMW);
+    auto *order = B.getInt32(StdOrderFromLlvm(RMW->getOrdering()));
+    auto *addr = ToVoidPtr(B, RMW->getPointerOperand());
+    auto *operand = RMW->getValOperand();
+
+    int op = -1;
+    switch (RMW->getOperation()) {
+      case AtomicRMWInst::Add: op = 0; break;
+      case AtomicRMWInst::Sub: op = 1; break;
+      case AtomicRMWInst::And: op = 2; break;
+      case AtomicRMWInst::Or: op = 3; break;
+      case AtomicRMWInst::Xor: op = 4; break;
+      case AtomicRMWInst::Xchg: op = 5; break;
+      case AtomicRMWInst::Max: op = 6; break;
+      case AtomicRMWInst::Min: op = 7; break;
+      case AtomicRMWInst::UMax: op = 8; break;
+      case AtomicRMWInst::UMin: op = 9; break;
+      default: return false;
+    }
+
+    auto *op_const = B.getInt32(op);
+    auto callee = GetRmwCallee(M, val_ty);
+    auto *call = B.CreateCall(callee, {addr, order, op_const, operand});
+
+    RMW->replaceAllUsesWith(call);
+    RMW->eraseFromParent();
+    return true;
+  }
+
+  bool InstrumentStdAtomicCall(CallInst *CI) {
+    auto *CF = CI->getCalledFunction();
+    if (!CF) {
+      return false;
+    }
+
+    if (IsStdAtomicLoad(CF)) {
+      if (CI->arg_size() < 2) {
+        return false;
+      }
+      auto *addr = CI->getArgOperand(0);
+      auto *order = CI->getArgOperand(1);
+      auto *val_ty = CI->getType();
+      if (!IsSupportedType(val_ty)) {
+        return false;
+      }
+      IRBuilder<> B(CI);
+      auto callee = GetLoadCallee(M, val_ty);
+      auto *call = B.CreateCall(callee, {ToVoidPtr(B, addr), order});
+      CI->replaceAllUsesWith(call);
+      CI->eraseFromParent();
+      return true;
+    }
+
+    if (IsStdAtomicStore(CF)) {
+      if (CI->arg_size() < 3) {
+        return false;
+      }
+      auto *addr = CI->getArgOperand(0);
+      auto *value = CI->getArgOperand(1);
+      auto *order = CI->getArgOperand(2);
+      auto *val_ty = value->getType();
+      if (!IsSupportedType(val_ty)) {
+        return false;
+      }
+      IRBuilder<> B(CI);
+      auto callee = GetStoreCallee(M, val_ty);
+      B.CreateCall(callee, {ToVoidPtr(B, addr), order, value});
+      CI->eraseFromParent();
+      return true;
+    }
+
+    if (IsStdAtomicCmpXchg(CF)) {
+      if (CI->arg_size() < 5) {
+        return false;
+      }
+      auto *addr = CI->getArgOperand(0);
+      auto *expected_ptr = CI->getArgOperand(1);
+      auto *desired = CI->getArgOperand(2);
+      auto *order_success = CI->getArgOperand(3);
+      auto *order_failure = CI->getArgOperand(4);
+      auto *val_ty = desired->getType();
+      if (!IsSupportedType(val_ty)) {
+        return false;
+      }
+
+      IRBuilder<> B(CI);
+      auto *expected_val = B.CreateLoad(val_ty, expected_ptr);
+      auto *is_weak = B.getInt1(IsStdAtomicCmpXchgWeak(CF));
+      auto callee = GetCmpXchgCallee(M, val_ty);
+      auto *call = B.CreateCall(
+          callee,
+          {ToVoidPtr(B, addr), expected_val, desired, order_success,
+           order_failure,
+           is_weak});
+
+      Instruction *insert_pt = CI->getNextNode();
+      if (!insert_pt) {
+        insert_pt = CI->getParent()->getTerminator();
+      }
+      IRBuilder<> Bafter(insert_pt);
+      auto *new_old = Bafter.CreateExtractValue(call, {0});
+      auto *new_success = Bafter.CreateExtractValue(call, {1});
+      Bafter.CreateStore(new_old, expected_ptr);
+
+      CI->replaceAllUsesWith(new_success);
+      CI->eraseFromParent();
+      return true;
+    }
+
+    return false;
+  }
+
+  Module &M;
+};
+
 struct YieldInserter {
   YieldInserter(Module &M) : M(M) {
     CoroYieldF = M.getOrInsertFunction(
@@ -59,8 +474,16 @@ struct YieldInserter {
   }
 
   bool NeedInterrupt(Instruction *insn, const FunIndex &index) {
+    if (auto *call = dyn_cast<CallInst>(insn)) {
+      if (auto *fun = call->getCalledFunction()) {
+        if (fun->hasName() && fun->getName().starts_with("__ltest_wmm_")) {
+          return true;
+        }
+      }
+    }
+
     if (isa<LoadInst>(insn) || isa<StoreInst>(insn) ||
-         isa<AtomicRMWInst>(insn) /*||
+         isa<AtomicCmpXchgInst>(insn) || isa<AtomicRMWInst>(insn) /*||
         isa<InvokeInst>(insn)*/) {
       return true;
     }
@@ -71,10 +494,22 @@ struct YieldInserter {
     Builder Builder(&*F.begin());
     for (auto &B : F) {
       for (auto it = B.begin(); std::next(it) != B.end(); ++it) {
-        if (NeedInterrupt(&*it, index) && !ItsYieldInst(&*std::next(it))) {
-          Builder.SetInsertPoint(&*std::next(it));
-          Builder.CreateCall(CoroYieldF, {})->getIterator();
-          ++it;
+        if (NeedInterrupt(&*it, index)) {
+          if (auto *next = dyn_cast<Instruction>(&*std::next(it))) {
+            if (auto *call = dyn_cast<CallInst>(next)) {
+              if (auto *fun = call->getCalledFunction()) {
+                if (fun->hasName() && fun->getName().starts_with("__ltest_wmm_")) {
+                  continue;
+                }
+              }
+            }
+          }
+
+          if (!ItsYieldInst(&*std::next(it))) {
+            Builder.SetInsertPoint(&*std::next(it));
+            Builder.CreateCall(CoroYieldF, {})->getIterator();
+            ++it;
+          }
         }
       }
     }
@@ -101,6 +536,8 @@ namespace {
 struct YieldInsertPass final : public PassInfoMixin<YieldInsertPass> {
   PreservedAnalyses run(Module &M, ModuleAnalysisManager &AM) {
     auto fun_index = CreateFunIndex(M);
+    WmmAtomicInserter wmm{M};
+    wmm.Run(fun_index);
 
     YieldInserter gen{M};
     gen.Run(fun_index);

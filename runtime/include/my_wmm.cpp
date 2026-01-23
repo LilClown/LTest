@@ -2,18 +2,31 @@
 
 #include <algorithm>
 #include <atomic>
-#include <cstdint>
 #include <iostream>
 #include <ostream>
 #include <random>
 #include <sstream>
 #include <unordered_set>
-#include <unordered_map>
 #include <vector>
 #include <cassert>
 #include <map>
 #include <ranges>
 
+
+enum class ReadStrategy {
+    Random,
+    PCT,
+};
+
+template<class T>
+struct ReadCandidate {
+    EventId writeId;
+    T value;
+    Event* writeEvent;
+    
+    ReadCandidate(EventId id, T val, Event* evt) 
+        : writeId(id), value(val), writeEvent(evt) {}
+};
 
 enum class MemoryOrder {
   Relaxed,
@@ -90,6 +103,8 @@ enum class EdgeType {
   // TODO: do we need it explicitly? hb-clocks can give the same basically
   // SW, // synchronized-with 
 };
+
+
 
 struct Edge {
   EdgeId id;
@@ -506,76 +521,124 @@ T Event::GetReadValue(Event* event) {
 
 class Graph {
 public:
+
+     ReadStrategy readStrategy = ReadStrategy::Random;
+
+    template<class T>
+    std::vector<ReadCandidate<T>> getReadCandidates(Event* readEvent) {
+        std::vector<ReadCandidate<T>> candidates;
+        
+        for (Event* writeEvent : events) {
+            if (!writeEvent->IsWriteOrRMW()) continue;
+            if (writeEvent->location != readEvent->location) continue;
+            if (writeEvent->id == readEvent->id) continue; 
+            
+            if (IsWriteVisibleToRead(writeEvent, readEvent)) {
+                T value = Event::GetWrittenValue<T>(writeEvent);
+                candidates.emplace_back(writeEvent->id, value, writeEvent);
+            }
+        }
+        
+        return candidates;
+    }
+
+    bool IsWriteVisibleToRead(Event* write, Event* read) {
+        if (write->location != read->location) return false;
+        
+        if (write->IsRelaxed() && read->IsRelaxed()) return true;
+        
+        if (write->IsAtLeastRelease() && read->IsAtLeastAcquire()) {
+            return true;         }
+        
+        if (write->IsSeqCst() && read->IsSeqCst()) {
+            return true; 
+        }
+        
+        return write->HappensBefore(read);
+    }   
+
+
+    template<class T, ReadStrategy S = ReadStrategy::Random>
+    typename std::enable_if<S == ReadStrategy::Random, ReadCandidate<T>>::type
+    makeChoice(std::vector<ReadCandidate<T>>& candidates) {
+        if (candidates.empty()) {
+            throw std::runtime_error("No read candidates available");
+        }
+        
+        std::uniform_int_distribution<size_t> dist(0, candidates.size() - 1);
+        size_t idx = dist(gen);
+        return candidates[idx];
+    }
+    
+    template<class T, ReadStrategy S = ReadStrategy::Random>
+    typename std::enable_if<S == ReadStrategy::PCT, ReadCandidate<T>>::type
+    makeChoice(std::vector<ReadCandidate<T>>& candidates) {
+        if (candidates.empty()) {
+            throw std::runtime_error("No read candidates available");
+        }
+        
+        std::uniform_int_distribution<size_t> dist(0, candidates.size() - 1);
+        size_t idx = dist(gen);
+        return candidates[idx];
+    }
+
+
   Graph() {}
   ~Graph() { Clean(); }  
-
- 
-  template<class T>
-  struct ReadCandidate {
-    // Кандидат на чтение: допустимое write-событие и его значение.
-    EventId writeId;
-    T value;
-    Event* writeEvent;
-  };
 
   void Reset(int nThreads) {
     Clean();
     InitThreads(nThreads);
   }
 
- 
-  void SetSeed(uint64_t seed) {
-    gen.seed(seed);
-  }
-
   // TODO: add `ExecutionPolicy` or other way of specifying how to create edges (Random, BoundedModelChecker, etc.)
-  template<class T>
-  T AddReadEvent(int location, int threadId, MemoryOrder order) {
-    EventId eventId = events.size();
-    auto event = new ReadEvent<T>(eventId, nThreads, location, threadId, order);
-    
-    // establish po-edge
-    CreatePoEdgeToEvent(event); // prevInThread --po--> event
-
-    auto shuffledEvents = GetShuffledReadFromCandidates(event);
-    for (auto readFromEvent : shuffledEvents) {
-      // try reading from `readFromEvent`
-      if (TryCreateRfEdge(readFromEvent, event)) {
-        std::cout << "Read event " << event->AsString() << " now reads from " << readFromEvent->AsString() << std::endl;
-        break;
-      }
+    template<class T>
+    T AddReadEvent(int location, int threadId, MemoryOrder order) {
+        EventId eventId = events.size();
+        auto event = new ReadEvent<T>(eventId, nThreads, location, threadId, order);
+        
+        // Устанавливаем po-edge
+        CreatePoEdgeToEvent(event);
+        
+        // Получаем кандидатов на чтение
+        auto candidates = getReadCandidates<T>(event);
+        
+        if (candidates.empty()) {
+            delete event;
+            throw std::runtime_error("No available write events to read from");
+        }
+        
+        // Выбираем кандидата в соответствии со стратегией
+        ReadCandidate<T> chosenCandidate;
+        if (readStrategy == ReadStrategy::Random) {
+            chosenCandidate = makeChoice<T, ReadStrategy::Random>(candidates);
+        } else if (readStrategy == ReadStrategy::PCT) {
+            chosenCandidate = makeChoice<T, ReadStrategy::PCT>(candidates);
+        }
+        
+        // Пытаемся создать rf-edge
+        if (!TryCreateRfEdge(chosenCandidate.writeEvent, event)) {
+            // Если не удалось, пробуем других кандидатов
+            for (const auto& candidate : candidates) {
+                if (candidate.writeId == chosenCandidate.writeId) continue;
+                
+                if (TryCreateRfEdge(candidate.writeEvent, event)) {
+                    std::cout << "Read event " << event->AsString() 
+                              << " now reads from " << candidate.writeEvent->AsString() << std::endl;
+                    break;
+                }
+            }
+        } else {
+            std::cout << "Read event " << event->AsString() 
+                      << " now reads from " << chosenCandidate.writeEvent->AsString() << std::endl;
+        }
+        
+        assert(event->readFrom != nullptr && "Read event must have appropriate write event to read from");
+        assert((event->readFrom->IsWrite() || event->readFrom->IsModifyRMW()) && 
+               "Read event must read from write or modifying rmw event");
+        
+        return Event::GetReadValue<T>(event);
     }
-
-    assert(event->readFrom != nullptr && "Read event must have appropriate write event to read from");
-    assert((event->readFrom->IsWrite() || event->readFrom->IsModifyRMW()) && "Read event must read from write or modifying rmw event");
-    return Event::GetReadValue<T>(event);
-  }
-
-  template<class T>
-  std::vector<ReadCandidate<T>> GetReadFromCandidates(int location, int threadId, MemoryOrder order) {
-    EventId eventId = events.size();
-    auto event = new ReadEvent<T>(eventId, nThreads, location, threadId, order);
-
-    // establish po-edge
-    CreatePoEdgeToEvent(event); // prevInThread --po--> event
-
-    std::vector<ReadCandidate<T>> candidates;
-
-    auto availableEvents = GetReadFromCandidatesForEvent(event);
-    for (auto readFromEvent : availableEvents) {
-      if (TryCreateRfEdgeWithCommit(readFromEvent, event, /*commit=*/false)) {
-        candidates.push_back(ReadCandidate<T>{
-          readFromEvent->id,
-          Event::GetWrittenValue<T>(readFromEvent),
-          readFromEvent
-        });
-      }
-    }
-
-    RemoveLastEventFromGraph(event);
-
-    return candidates;
-  }
 
   template<class T>
   void AddWriteEvent(int location, int threadId, MemoryOrder order, T value) {
@@ -603,33 +666,59 @@ public:
     CreateWriteWriteCoherenceEdges(event);
   }
 
-  template<class T>
-  std::pair<bool, T> AddRMWEvent(int location, int threadId, T* expected, T desired,
-                MemoryOrder successOrder, MemoryOrder failureOrder) {
-    EventId eventId = events.size();
-    auto event = new RMWEvent<T>(
-      eventId, nThreads, location, threadId, expected, desired, successOrder, failureOrder
-    );
-
-    // establish po-edge
-    CreatePoEdgeToEvent(event); // prevInThread --po--> event
-
-    auto shuffledEvents = GetShuffledReadFromCandidates(event);
-    for (auto readFromEvent : shuffledEvents) {
-      // try reading from `readFromEvent`
-      if (TryCreateRfEdge(readFromEvent, event)) {
-        std::cout << "RMW event " << event->AsString() << " now reads from " << readFromEvent->AsString() << std::endl;
-        break;
-      }
+    template<class T>
+    std::pair<bool, T> AddRMWEvent(int location, int threadId, T* expected, T desired,
+                                   MemoryOrder successOrder, MemoryOrder failureOrder) {
+        EventId eventId = events.size();
+        auto event = new RMWEvent<T>(
+            eventId, nThreads, location, threadId, expected, desired, successOrder, failureOrder
+        );
+        
+        // Устанавливаем po-edge
+        CreatePoEdgeToEvent(event);
+        
+        // Получаем кандидатов на чтение
+        auto candidates = getReadCandidates<T>(event);
+        
+        if (candidates.empty()) {
+            delete event;
+            throw std::runtime_error("No available write events to read from for RMW");
+        }
+        
+        // Выбираем кандидата в соответствии со стратегией
+        ReadCandidate<T> chosenCandidate;
+        if (readStrategy == ReadStrategy::Random) {
+            chosenCandidate = makeChoice<T, ReadStrategy::Random>(candidates);
+        } else if (readStrategy == ReadStrategy::PCT) {
+            chosenCandidate = makeChoice<T, ReadStrategy::PCT>(candidates);
+        }
+        
+        // Пытаемся создать rf-edge
+        if (!TryCreateRfEdge(chosenCandidate.writeEvent, event)) {
+            // Если не удалось, пробуем других кандидатов
+            for (const auto& candidate : candidates) {
+                if (candidate.writeId == chosenCandidate.writeId) continue;
+                
+                if (TryCreateRfEdge(candidate.writeEvent, event)) {
+                    std::cout << "RMW event " << event->AsString() 
+                              << " now reads from " << candidate.writeEvent->AsString() << std::endl;
+                    break;
+                }
+            }
+        } else {
+            std::cout << "RMW event " << event->AsString() 
+                      << " now reads from " << chosenCandidate.writeEvent->AsString() << std::endl;
+        }
+        
+        assert(event->readFrom != nullptr && "RMW event must have appropriate write event to read from");
+        assert((event->readFrom->IsWrite() || event->readFrom->IsModifyRMW()) && 
+               "RMW event must read from write or modifying rmw event");
+        
+        return {
+            event->IsModifyRMW(),
+            Event::GetReadValue<T>(event)
+        };
     }
-
-    assert(event->readFrom != nullptr && "RMW event must have appropriate write event to read from");
-    assert((event->readFrom->IsWrite() || event->readFrom->IsModifyRMW()) && "RMW event must read from write or modifying rmw event");
-    return {
-      event->IsModifyRMW(), // true if RMW is resolved to MODIFY state, false if rmw failed and resolve to READ state 
-      Event::GetReadValue<T>(event)
-    };
-  }
 
   void Print(std::ostream& os) const {
     os << "Graph edges:" << std::endl;
@@ -644,18 +733,10 @@ public:
   }
 
 private:
-  std::vector<Event*> GetReadFromCandidatesForEvent(Event* event) {
-    auto filteredEventsView = events | std::views::filter(
-      [event](Event* e) {
-        return (
-          (e->IsWrite() || e->IsModifyRMW()) &&
-          e->location == event->location &&
-          e != event
-        );
-      }
-    );
-    return {filteredEventsView.begin(), filteredEventsView.end()};
-  }
+
+  void setReadStrategy(ReadStrategy strategy) {
+        readStrategy = strategy;
+    }
 
   std::vector<Event*> GetShuffledReadFromCandidates(Event* event) {
     // Shuffle events to randomize the order of read-from edges
@@ -678,10 +759,6 @@ private:
   // Tries to create a read-from edge between `write` and `read` events (write --rf--> read).
   // Returns `true` if edge was created, `false` otherwise.
   bool TryCreateRfEdge(Event* write, Event* read) {
-    return TryCreateRfEdgeWithCommit(write, read, true);
-  }
-
-  bool TryCreateRfEdgeWithCommit(Event* write, Event* read, bool commit) {
     assert(write->IsWriteOrRMW() && read->IsReadOrRMW() && "Write and Read events must be of correct type");
     assert(write->location == read->location && "Write and Read events must be of the same location");
 
@@ -773,17 +850,8 @@ private:
     if (isConsistent) {
       std::cout << "Consistent graph:" << std::endl;
       Print(std::cout);
-      if (commit) {
-        ApplySnapshot();
-      }
-      else {
-        DiscardSnapshot();
-        read->SetReadFromEvent(nullptr);
-        if (isClockUpdated) {
-          read->clock = oldClock;
-        }
-        lastSeqCstWriteEvents[read->location] = oldLastSeqCstWriteEvent;
-      }
+      // preserve added edges and other modifications
+      ApplySnapshot();
     }
     else {
       std::cout << "Not consistent graph:" << std::endl;
@@ -1204,27 +1272,6 @@ private:
     }
   }
 
-  void RemoveLastEventFromGraph(Event* event) {
-    int threadId = event->threadId;
-    auto& threadEvents = eventsPerThread[threadId];
-    assert(threadEvents.size() >= 2 && threadEvents.back() == event->id && "Event to remove must be the latest in its thread");
-
-    EventId prevEventId = threadEvents[threadEvents.size() - 2];
-    auto& prevEdges = events[prevEventId]->edges;
-    assert(!prevEdges.empty() && "Previous event must have outgoing edges");
-
-    EdgeId poEdgeId = prevEdges.back();
-    assert(edges[poEdgeId].to == event->id && "Last edge from previous event must be the po-edge to the event being removed");
-    prevEdges.pop_back();
-
-    assert(!edges.empty() && edges.back().id == poEdgeId && "PO edge is expected to be the latest edge in graph");
-    edges.pop_back();
-
-    threadEvents.pop_back();
-    events.pop_back();
-    delete event;
-  }
-
   std::vector<Edge> edges;
   std::vector<Event*> events;
   std::vector<std::vector<EventId>> eventsPerThread;
@@ -1252,14 +1299,9 @@ ExecutionGraph(const ExecutionGraph&) = delete;
     std::cout << "Reset Graph: threads=" << nThreads << std::endl;
     this->nThreads = nThreads;
     this->nextLocationId = 0;
-    this->locationByAddr.clear();
 
     graph.Reset(nThreads);
     graph.Print(std::cout);
-  }
-
-  void SetSeed(uint64_t seed) {
-    graph.SetSeed(seed);
   }
 
   // When new location is constructed, it registers itself in the wmm-graph
@@ -1272,25 +1314,6 @@ ExecutionGraph(const ExecutionGraph&) = delete;
     
     graph.Print(std::cout);
     return currentLocationId;
-  }
-
-  template<class T>
-  int GetOrRegisterLocation(void* addr, T initial_value) {
-    auto it = locationByAddr.find(addr);
-    if (it != locationByAddr.end()) {
-      return it->second;
-    }
-    int locationId = RegisterLocation<T>(initial_value);
-    locationByAddr.emplace(addr, locationId);
-    return locationId;
-  }
-
-  template<class T>
-  std::vector<typename Graph::template ReadCandidate<T>> LoadCandidates(int location, int threadId, MemoryOrder order) {
-    std::cout << "Load candidates: loc-" << location << ", thread=" << threadId << ", order=" << WmmUtils::OrderToString(order) << std::endl;
-    auto candidates = graph.GetReadFromCandidates<T>(location, threadId, order);
-    std::cout << "Available candidates: " << candidates.size() << std::endl;
-    return candidates;
   }
 
   template<class T>
@@ -1325,13 +1348,20 @@ ExecutionGraph(const ExecutionGraph&) = delete;
     return rmwResult;
   }
 
+    void setReadStrategy(ReadStrategy strategy) {
+        graph.setReadStrategy(strategy);
+    }
+
+
 private:
   ExecutionGraph() = default;
   ~ExecutionGraph() = default;
 
   int nThreads = 0;
   int nextLocationId = 0;
-  std::unordered_map<void*, int> locationByAddr;
   Graph graph;
+
+  ReadStrategy currentStrategy = ReadStrategy::Random;
+
   // TODO: here can add real atomic's name via clangpass
 };

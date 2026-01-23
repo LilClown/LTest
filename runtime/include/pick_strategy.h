@@ -12,9 +12,11 @@ struct PickStrategy : public BaseStrategyWithThreads<TargetObj, Verifier> {
   virtual size_t PickSchedule() = 0;
 
   explicit PickStrategy(size_t threads_count,
-                        std::vector<TaskBuilder> constructors)
+                        std::vector<TaskBuilder> constructors,
+                        uint64_t seed = 0)
       : BaseStrategyWithThreads<TargetObj, Verifier>(threads_count,
-                                                     std::move(constructors)),
+                                                     std::move(constructors),
+                                                     seed),
         next_task(0) {}
 
   // If there aren't any non returned tasks and the amount of finished tasks

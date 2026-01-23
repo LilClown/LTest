@@ -67,6 +67,7 @@ DEFINE_int32(threads, 2, "Number of threads");
 DEFINE_int32(tasks, 15, "Number of tasks");
 DEFINE_int32(switches, 100000000, "Number of switches");
 DEFINE_int32(rounds, 5, "Number of rounds");
+DEFINE_uint64(seed, 0, "Seed for scheduling/WMM (0 = random)");
 DEFINE_bool(minimize, false, "Minimize nonlinear scenario");
 DEFINE_int32(exploration_runs, 15,
              "Number of attempts to find nonlinearized round during each "
@@ -87,6 +88,7 @@ Opts parse_opts() {
   opts.tasks = FLAGS_tasks;
   opts.switches = FLAGS_switches;
   opts.rounds = FLAGS_rounds;
+  opts.seed = FLAGS_seed;
   opts.forbid_all_same = FLAGS_forbid_all_same;
   opts.minimize = FLAGS_minimize;  // NOTE(dartiukhov) minimization for
                                    // scenarios with locks is not supported

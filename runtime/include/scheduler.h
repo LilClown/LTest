@@ -1,4 +1,5 @@
 #pragma once
+#include <cstdint>
 #include <limits>
 #include <optional>
 #include <random>
@@ -122,11 +123,17 @@ struct Strategy {
 template <typename TargetObj, StrategyVerifier Verifier>
 struct BaseStrategyWithThreads : public Strategy {
   explicit BaseStrategyWithThreads(size_t threads_count,
-                                   std::vector<TaskBuilder> constructors) {
+                                   std::vector<TaskBuilder> constructors,
+                                   uint64_t seed = 0) {
     this->threads_count = threads_count;
     this->constructors = std::move(constructors);
-    std::random_device dev;
-    this->rng = std::mt19937(dev());
+    if (seed != 0) {
+      this->rng = std::mt19937(seed);
+      wmm_graph.SetSeed(seed);
+    } else {
+      std::random_device dev;
+      this->rng = std::mt19937(dev());
+    }
     this->constructors_distribution =
     std::uniform_int_distribution<std::mt19937::result_type>(
       0, this->constructors.size() - 1);

@@ -7,10 +7,12 @@
 template <typename TargetObj, StrategyVerifier Verifier>
 struct RoundRobinStrategy : PickStrategy<TargetObj, Verifier> {
   explicit RoundRobinStrategy(size_t threads_count,
-                              std::vector<TaskBuilder> constructors)
+                              std::vector<TaskBuilder> constructors,
+                              uint64_t seed = 0)
       : next_task{0},
         PickStrategy<TargetObj, Verifier>{threads_count,
-                                          std::move(constructors)} {}
+                                          std::move(constructors),
+                                          seed} {}
 
   size_t Pick() override {
     auto &threads = PickStrategy<TargetObj, Verifier>::threads;

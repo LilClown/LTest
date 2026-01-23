@@ -16,9 +16,11 @@ struct PctStrategy : public BaseStrategyWithThreads<TargetObj, Verifier> {
   // instance, you don't want to run mutex.lock in each thread
   explicit PctStrategy(size_t threads_count,
                        std::vector<TaskBuilder> constructors,
-                       bool forbid_all_same)
+                       bool forbid_all_same,
+                       uint64_t seed = 0)
       : BaseStrategyWithThreads<TargetObj, Verifier>(threads_count,
-                                                     std::move(constructors)),
+                                                     std::move(constructors),
+                                                     seed),
         current_depth(1),
         current_schedule_length(0),
         forbid_all_same(forbid_all_same) {
