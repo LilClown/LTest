@@ -1,7 +1,8 @@
 __pycache__
 build
 venv
-.vscode
+.vscode/*
+!.vscode/settings.json
 .devcontainer/**
 .cache/**
 third_party/**
